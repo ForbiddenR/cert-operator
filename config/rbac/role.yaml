@@ -17,6 +17,7 @@ rules:
   - certs.example.com
   resources:
   - certificates
+  - tlsrequests
   verbs:
   - create
   - delete
@@ -29,12 +30,14 @@ rules:
   - certs.example.com
   resources:
   - certificates/finalizers
+  - tlsrequests/finalizers
   verbs:
   - update
 - apiGroups:
   - certs.example.com
   resources:
   - certificates/status
+  - tlsrequests/status
   verbs:
   - get
   - patch

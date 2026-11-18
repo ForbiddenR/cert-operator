@@ -22,6 +22,9 @@ resources:
 # default, aiding admins in cluster management. Those roles are
 # not used by the cert-operator itself. You can comment the following lines
 # if you do not want those helpers be installed with your Project.
+- tlsrequest_admin_role.yaml
+- tlsrequest_editor_role.yaml
+- tlsrequest_viewer_role.yaml
 - certificate_admin_role.yaml
 - certificate_editor_role.yaml
 - certificate_viewer_role.yaml

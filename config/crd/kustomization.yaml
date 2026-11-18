@@ -3,6 +3,7 @@
 # It should be run by config/default
 resources:
 - bases/certs.example.com_certificates.yaml
+- bases/certs.example.com_tlsrequests.yaml
 # +kubebuilder:scaffold:crdkustomizeresource
 
 patches:
