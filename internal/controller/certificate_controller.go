@@ -18,13 +18,20 @@ package controller
 
 import (
 	"context"
+	"fmt"
+	"time"
 
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	logf "sigs.k8s.io/controller-runtime/pkg/log"
+
+	// logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	certsv1alpha1 "example.com/mini-cert-operator/api/v1alpha1"
+	"example.com/mini-cert-operator/internal/certificates"
 )
 
 // CertificateReconciler reconciles a Certificate object
@@ -36,6 +43,7 @@ type CertificateReconciler struct {
 // +kubebuilder:rbac:groups=certs.example.com,resources=certificates,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=certs.example.com,resources=certificates/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=certs.example.com,resources=certificates/finalizers,verbs=update
+// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;create
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
@@ -47,17 +55,67 @@ type CertificateReconciler struct {
 // For more details, check Reconcile and its Result here:
 // - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.25.0/pkg/reconcile
 func (r *CertificateReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	_ = logf.FromContext(ctx)
+	// _ = logf.FromContext(ctx)
 
-	// TODO(user): your logic here
+	var cert certsv1alpha1.Certificate
+	if err := r.Get(ctx, req.NamespacedName, &cert); err != nil {
+		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+	if !cert.DeletionTimestamp.IsZero() {
+		return ctrl.Result{}, nil
+	}
 
-	return ctrl.Result{}, nil
+	key := client.ObjectKey{
+		Namespace: cert.Namespace,
+		Name:      cert.Spec.SecretName,
+	}
+
+	var existing corev1.Secret
+	err := r.Get(ctx, key, &existing)
+	if err == nil {
+		if !metav1.IsControlledBy(&existing, &cert) {
+			return ctrl.Result{}, fmt.Errorf(
+				"Secret %s/%s already exists and is owned by another resource or has on owner",
+				key.Namespace, key.Name,
+			)
+		}
+		return ctrl.Result{}, nil
+	}
+	if !apierrors.IsNotFound(err) {
+		return ctrl.Result{}, err
+	}
+
+	duration, err := time.ParseDuration(cert.Spec.Duration)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("parse spec.duration: %w", err)
+	}
+	material, err := certificates.Generate(cert.Spec.DNSNames, duration)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      key.Name,
+			Namespace: key.Namespace,
+		},
+		Type: corev1.SecretTypeTLS,
+		Data: map[string][]byte{
+			corev1.TLSCertKey:       material.CertificatePEM,
+			corev1.TLSPrivateKeyKey: material.PrivateKeyPEM,
+		},
+	}
+	if err := ctrl.SetControllerReference(&cert, secret, r.Scheme); err != nil {
+		return ctrl.Result{}, err
+	}
+	return ctrl.Result{}, r.Create(ctx, secret)
 }
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *CertificateReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&certsv1alpha1.Certificate{}).
+		Owns(&corev1.Secret{}).
 		Named("certificate").
 		Complete(r)
 }
