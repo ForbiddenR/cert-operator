@@ -18,11 +18,16 @@ package controller
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
+	"errors"
 	"fmt"
+	"slices"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -32,6 +37,7 @@ import (
 
 	certsv1alpha1 "example.com/mini-cert-operator/api/v1alpha1"
 	"example.com/mini-cert-operator/internal/certificates"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 )
 
 // CertificateReconciler reconciles a Certificate object
@@ -65,50 +71,75 @@ func (r *CertificateReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return ctrl.Result{}, nil
 	}
 
+	duration, err := time.ParseDuration(cert.Spec.Duration)
+	if err != nil || duration < time.Minute {
+		return ctrl.Result{}, errors.New("spec.duration must be a valid duration of at least 1m")
+	}
+	renewBefore, err := time.ParseDuration(cert.Spec.RenewBefore)
+	if err != nil || renewBefore <= 0 || renewBefore >= duration {
+		return ctrl.Result{}, errors.New("spec.renewBefore must be positive and shorter than duration")
+	}
+
 	key := client.ObjectKey{
 		Namespace: cert.Namespace,
 		Name:      cert.Spec.SecretName,
 	}
+	var secret corev1.Secret
+	err = r.Get(ctx, key, &secret)
+	missing := apierrors.IsNotFound(err)
 
-	var existing corev1.Secret
-	err := r.Get(ctx, key, &existing)
-	if err == nil {
-		if !metav1.IsControlledBy(&existing, &cert) {
+	var notAfter time.Time
+	switch {
+	case missing:
+		secret = corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      key.Name,
+				Namespace: key.Namespace,
+			},
+		}
+		if err := ctrl.SetControllerReference(&cert, &secret, r.Scheme); err != nil {
+			return ctrl.Result{}, err
+		}
+	case err != nil:
+		return ctrl.Result{}, err
+	default:
+		if !metav1.IsControlledBy(&secret, &cert) {
 			return ctrl.Result{}, fmt.Errorf(
 				"Secret %s/%s already exists and is owned by another resource or has on owner",
 				key.Namespace, key.Name,
 			)
 		}
-		return ctrl.Result{}, nil
-	}
-	if !apierrors.IsNotFound(err) {
-		return ctrl.Result{}, err
+		notAfter = existingExpiry(&secret, cert.Spec.DNSNames)
 	}
 
-	duration, err := time.ParseDuration(cert.Spec.Duration)
-	if err != nil {
-		return ctrl.Result{}, fmt.Errorf("parse spec.duration: %w", err)
-	}
-	material, err := certificates.Generate(cert.Spec.DNSNames, duration)
-	if err != nil {
-		return ctrl.Result{}, err
-	}
+	if notAfter.IsZero() || time.Until(notAfter.Add(-renewBefore)) <= 0 {
+		material, err := certificates.Generate(cert.Spec.DNSNames, duration)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		secret.Type = corev1.SecretTypeTLS
+		if secret.Data == nil {
+			secret.Data = make(map[string][]byte)
+		}
+		secret.Data[corev1.TLSCertKey] = material.CertificatePEM
+		secret.Data[corev1.TLSPrivateKeyKey] = material.PrivateKeyPEM
 
-	secret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      key.Name,
-			Namespace: key.Namespace,
-		},
-		Type: corev1.SecretTypeTLS,
-		Data: map[string][]byte{
-			corev1.TLSCertKey:       material.CertificatePEM,
-			corev1.TLSPrivateKeyKey: material.PrivateKeyPEM,
-		},
+		if missing {
+			err = r.Create(ctx, &secret)
+		} else {
+			err = r.Update(ctx, &secret)
+		}
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		notAfter = material.NotAfter
 	}
-	if err := ctrl.SetControllerReference(&cert, secret, r.Scheme); err != nil {
+	renewalTime := notAfter.Add(-renewBefore)
+	if err := r.recordReady(ctx, &cert, notAfter, renewalTime); err != nil {
 		return ctrl.Result{}, err
 	}
-	return ctrl.Result{}, r.Create(ctx, secret)
+	delay := max(time.Second, time.Until(renewalTime))
+	return ctrl.Result{RequeueAfter: delay}, nil
 }
 
 // SetupWithManager sets up the controller with the Manager.
@@ -118,4 +149,48 @@ func (r *CertificateReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&corev1.Secret{}).
 		Named("certificate").
 		Complete(r)
+}
+
+func (r *CertificateReconciler) recordReady(
+	ctx context.Context,
+	cert *certsv1alpha1.Certificate,
+	notAfter, renewalTime time.Time,
+) error {
+	before := cert.DeepCopy()
+	expiry := metav1.NewTime(notAfter)
+	renewal := metav1.NewTime(renewalTime)
+
+	cert.Status.ObservedGeneration = cert.Generation
+	cert.Status.NotAfter = &expiry
+	cert.Status.RenewalTime = &renewal
+	meta.SetStatusCondition(&cert.Status.Conditions, metav1.Condition{
+		Type:               "Ready",
+		Status:             metav1.ConditionTrue,
+		ObservedGeneration: cert.Generation,
+		Reason:             "SecretReady",
+		Message:            "TLS Secret is ready",
+	})
+
+	if apiequality.Semantic.DeepEqual(before.Status, cert.Status) {
+		return nil
+	}
+	return r.Status().Update(ctx, cert)
+}
+
+func existingExpiry(secret *corev1.Secret, dnsNames []string) time.Time {
+	if secret.Type != corev1.SecretTypeTLS {
+		return time.Time{}
+	}
+	pair, err := tls.X509KeyPair(
+		secret.Data[corev1.TLSCertKey],
+		secret.Data[corev1.TLSPrivateKeyKey],
+	)
+	if err != nil {
+		return time.Time{}
+	}
+	leaf, err := x509.ParseCertificate(pair.Certificate[0])
+	if err != nil || !slices.Equal(leaf.DNSNames, dnsNames) {
+		return time.Time{}
+	}
+	return leaf.NotAfter
 }
